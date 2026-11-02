@@ -10,8 +10,6 @@
 - **C# / .NET 10 (LTS), WPF** — один самодостаточный `.exe`, без установленного .NET и без WebView2.
 - Без NuGet-зависимостей: HTTP — `HttpClient`, JSON — `System.Text.Json`, трей — Win32 `Shell_NotifyIcon`,
   меню — нативное `TrackPopupMenu`, автозапуск — реестр.
-- Дизайн-токены из макета: акцент `#D97757`, success `#34C759`, warning `#FF9F0A`,
-  surface `#17181D`, muted `#7E7E88`, шрифт Segoe UI Variable (фолбэк — Segoe UI).
 
 ## Сборка
 
@@ -34,8 +32,7 @@ dotnet publish -c Release -r win-x64 --self-contained true `
   -p:EnableCompressionInSingleFile=true
 ```
 
-Готовый файл — `IpGuardWidget.exe` (~50–70 МБ). Его можно просто скопировать на другую
-Windows 10/11 машину и запустить.
+Готовый файл — `IpGuardWidget.exe` (~50–70 МБ)
 
 ## Запуск
 
