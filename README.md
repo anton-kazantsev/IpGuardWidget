@@ -21,9 +21,7 @@
 - **C# / .NET 10 (LTS), WPF** — один самодостаточный `.exe`, без установленного .NET и без WebView2.
 - Без NuGet-зависимостей: HTTP — `HttpClient`, JSON — `System.Text.Json`, трей — Win32 `Shell_NotifyIcon`,
   меню — нативное `TrackPopupMenu`, автозапуск — реестр.
-- Дизайн-токены из макета: акцент `#E2815F`, success `#34C759`, warning `#FF9F0A`,
-  surface `#17181D`, muted `#7E7E88`, шрифт Segoe UI Variable (фолбэк — Segoe UI).
-
+  
 ## Сборка
 
 Проект лежит в `C:\pet-projects\IpGuardWidget`. Нужен только
