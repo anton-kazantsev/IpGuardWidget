@@ -13,7 +13,9 @@ public sealed class Settings
     public double? AnchorBottom { get; set; }
 
     public bool AlwaysOnTop { get; set; } = true;
-    public string Shell { get; set; } = "cmd"; // cmd | pwsh | direct
+
+    /// <summary>cmd | pwsh | direct. Empty until the user picks a shell in the widget.</summary>
+    public string Shell { get; set; } = "";
     public string WorkingDirectory { get; set; } = "";
     public string ClaudePath { get; set; } = "";
 }

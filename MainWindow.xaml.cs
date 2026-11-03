@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.IO;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -13,13 +14,24 @@ namespace IpGuard;
 public partial class MainWindow : Window
 {
     private const double WindowPadding = 16;
-    private const double CardNormalHeight = 277;
-    private const double CardNoticeHeight = 340;
+    private const double CardNormalHeight = 288;
+    private const double CardNoticeHeight = 351;
     private const double NoticeHostHeight = 63;
+    private const double PopupGap = 8;
+    private const double PopupPanelWidth = 178;
+    private const double PopupPanelHeight = 98;
+
+    private static readonly (string Key, string Name)[] ShellOptions =
+    {
+        ("cmd", "cmd"),
+        ("pwsh", "PowerShell"),
+        ("direct", "напрямую")
+    };
 
     private readonly SettingsStore _store;
     private readonly WidgetViewModel _viewModel;
     private readonly LaunchService _launcher = new();
+    private readonly ClaudeGuard _claudeGuard;
     private readonly DispatcherTimer _saveTimer;
     private TrayIcon? _tray;
     private bool _exiting;
@@ -33,6 +45,15 @@ public partial class MainWindow : Window
         _store = store;
         _viewModel = new WidgetViewModel(new IpCheckService(), simulate);
         DataContext = _viewModel;
+
+        // Stops `claude` started from any terminal while the VPN is off.
+        _claudeGuard = new ClaudeGuard(() => _viewModel.State == WidgetState.Blocked);
+        _claudeGuard.BlockedLaunch += (_, _) => ShowWidget();
+
+        Deactivated += (_, _) => ShellPopup.IsOpen = false;
+        ShellPopup.Opened += (_, _) => AnimateShellChevron(90);
+        ShellPopup.Closed += (_, _) => AnimateShellChevron(0);
+        UpdateShellLabel();
 
         Topmost = store.Current.AlwaysOnTop;
         RestorePosition();
@@ -106,6 +127,163 @@ public partial class MainWindow : Window
         {
             _tray?.SetTooltip(_viewModel.TooltipText);
         }
+        else if (e.PropertyName == nameof(WidgetViewModel.State))
+        {
+            // Tray icon follows the VPN state: accent when the VPN is on, gray otherwise.
+            _tray?.SetVpnOn(_viewModel.State == WidgetState.Allowed);
+        }
+    }
+
+    private void CollapseButton_Click(object sender, RoutedEventArgs e)
+    {
+        ShellPopup.IsOpen = false;
+        Hide();
+        SavePlacement();
+    }
+
+    /// <summary>
+    /// The flyout closes itself on any click outside (StaysOpen=False) — including a click on the
+    /// chip itself, which then arrives as a Button click and would reopen it. A click that comes
+    /// right after the flyout closed is treated as the "close" click.
+    /// </summary>
+    private void ShellButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (ShellPopup.IsOpen)
+        {
+            ShellPopup.IsOpen = false;
+            return;
+        }
+
+        BuildShellMenu();
+        PlaceShellPopup();
+        ShellPopup.IsOpen = true;
+    }
+
+    /// <summary>Closes the shell flyout when the user clicks anywhere else in the card.</summary>
+    private void Root_PreviewMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        if (!ShellPopup.IsOpen || IsInside(e.OriginalSource as DependencyObject, ShellButton))
+        {
+            return;
+        }
+
+        ShellPopup.IsOpen = false;
+    }
+
+    private static bool IsInside(DependencyObject? source, DependencyObject target)
+    {
+        while (source is not null)
+        {
+            if (ReferenceEquals(source, target))
+            {
+                return true;
+            }
+
+            source = VisualTreeHelper.GetParent(source);
+        }
+
+        return false;
+    }
+
+    /// <summary>Puts the flyout's visible panel 8 px left of the chip, bottom edges aligned.</summary>
+    private void PlaceShellPopup()
+    {
+        var dpi = VisualTreeHelper.GetDpi(this);
+        var origin = ShellButton.PointToScreen(new Point(0, 0));
+        var left = origin.X / dpi.DpiScaleX;
+        var bottom = origin.Y / dpi.DpiScaleY + ShellButton.ActualHeight;
+
+        ShellPopup.Placement = PlacementMode.Absolute;
+        ShellPopup.HorizontalOffset = left - PopupGap - PopupPanelWidth;
+        ShellPopup.VerticalOffset = bottom - PopupPanelHeight;
+    }
+
+    /// <summary>Turns the chip chevron towards the flyout while it is open, back down when it closes.</summary>
+    private void AnimateShellChevron(double angle)
+    {
+        var animation = new DoubleAnimation(ShellChevronRotate.Angle, angle, TimeSpan.FromMilliseconds(150))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            FillBehavior = FillBehavior.HoldEnd
+        };
+
+        ShellChevronRotate.BeginAnimation(RotateTransform.AngleProperty, animation);
+    }
+
+    private static string ShellName(string? shell) => (shell ?? "").Trim().ToLowerInvariant() switch
+    {
+        "pwsh" or "powershell" => "PowerShell",
+        "direct" or "exe" => "напрямую",
+        "cmd" => "cmd",
+        _ => "Выбери оболочку"
+    };
+
+    private void UpdateShellLabel()
+    {
+        ShellLabel.Text = ShellName(_store.Current.Shell);
+    }
+
+    private void BuildShellMenu()
+    {
+        ShellPopupItems.Children.Clear();
+        var current = (_store.Current.Shell ?? "").Trim().ToLowerInvariant();
+        var text = new SolidColorBrush(Color.FromRgb(0xE7, 0xE7, 0xEA));
+        var check = new SolidColorBrush(Color.FromRgb(0x7F, 0xB2, 0xE5));
+        var style = (Style)FindResource("ShellMenuItemStyle");
+
+        foreach (var (key, name) in ShellOptions)
+        {
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var tick = new System.Windows.Shapes.Path
+            {
+                Data = Geometry.Parse("M0,4.5 L3.5,9 L10,0"),
+                Width = 10,
+                Height = 9,
+                Stretch = Stretch.None,
+                Stroke = check,
+                StrokeThickness = 1.6,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                Visibility = key == current ? Visibility.Visible : Visibility.Hidden
+            };
+            Grid.SetColumn(tick, 0);
+
+            var label = new TextBlock
+            {
+                Text = name,
+                FontSize = 12.5,
+                Foreground = text,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(label, 1);
+
+            row.Children.Add(tick);
+            row.Children.Add(label);
+
+            var item = new Button
+            {
+                Style = style,
+                Content = row,
+                Tag = key
+            };
+            item.Click += ShellOption_Click;
+            ShellPopupItems.Children.Add(item);
+        }
+    }
+
+    private void ShellOption_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string key })
+        {
+            SetShell(key);
+        }
+
+        ShellPopup.IsOpen = false;
     }
 
     public void ShowWidget()
@@ -125,6 +303,8 @@ public partial class MainWindow : Window
 
     private void ToggleVisibility()
     {
+        ShellPopup.IsOpen = false;
+
         if (IsVisible)
         {
             Hide();
@@ -315,6 +495,7 @@ public partial class MainWindow : Window
     {
         _store.Current.Shell = shell;
         _store.Save();
+        UpdateShellLabel();
     }
 
     private void PickWorkingDirectory()
@@ -346,6 +527,7 @@ public partial class MainWindow : Window
     {
         _exiting = true;
         SavePlacement();
+        _claudeGuard.Dispose();
         _viewModel.Dispose();
         _tray?.Dispose();
         _tray = null;

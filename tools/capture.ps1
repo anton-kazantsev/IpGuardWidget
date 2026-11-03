@@ -10,10 +10,19 @@ param(
 )
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-$exe = "C:\Users\baksf\Documents\IpGuardWidget\bin\Debug\net10.0-windows\win-x64\IpGuardWidget.exe"
+
+$root = Split-Path -Parent $PSScriptRoot
+$exe = Join-Path $root 'bin\Debug\net10.0-windows\win-x64\IpGuardWidget.exe'
+if (-not (Test-Path $exe)) {
+    $exe = Join-Path $root 'dist\IpGuardWidget-v1.1.exe'
+}
+if (-not (Test-Path $exe)) {
+    Write-Error "IpGuardWidget.exe not found: build the project (bin\Debug\net10.0-windows\win-x64\IpGuardWidget.exe) or publish to dist\IpGuardWidget-v1.1.exe under $root"
+    exit 1
+}
 
 if ($Mode -ne "") {
-    Get-Process IpGuardWidget -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process | Where-Object { $_.ProcessName -like 'IpGuardWidget*' } | Stop-Process -Force
     Start-Sleep -Milliseconds 400
     Start-Process -FilePath $exe -ArgumentList '--simulate', $Mode | Out-Null
     Start-Sleep -Milliseconds $DelayMs

@@ -210,11 +210,14 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
 
     private void ScheduleNext()
     {
+        // Russia: poll fast to catch the moment the VPN is switched on (5 s).
+        // VPN on: poll slower, just to notice a changed IP/country (20 s).
+        // Offline: retry until the network is back (30 s).
         var interval = _offline
             ? TimeSpan.FromSeconds(30)
             : State == WidgetState.Blocked
-                ? TimeSpan.FromSeconds(20)
-                : TimeSpan.FromMinutes(5);
+                ? TimeSpan.FromSeconds(5)
+                : TimeSpan.FromSeconds(20);
 
         _timer.Stop();
         _timer.Interval = interval;
@@ -321,7 +324,7 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         }
         else
         {
-            NoticeTitle = "Claude Code недоступен из РФ";
+            NoticeTitle = "Claude Code заблокирован в РФ";
             NoticeBody = "Включи VPN — кнопка включится после смены IP";
         }
 
@@ -385,10 +388,10 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         }
         else
         {
-            FooterLeft = "Откроет Windows Terminal";
+            FooterLeft = "Откроется Terminal";
         }
 
-        FooterLink = blocked ? "Проверить снова" : checking || hasData ? "Обновить IP" : "Повторить";
+        FooterLink = !hasData && !checking ? "Повторить" : "Обновить IP";
         IsFooterLinkEnabled = !_checking;
 
         TooltipText = hasData ? $"IP Guard · {IpAddress} · {PillText}" : "IP Guard";

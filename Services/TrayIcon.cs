@@ -1,3 +1,4 @@
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
@@ -40,6 +41,7 @@ public sealed class TrayIcon : IDisposable
     private readonly uint _taskbarCreated;
     private IntPtr _icon;
     private bool _added;
+    private bool _vpnOn;
     private string _tooltip = "IP Guard";
 
     public event Action? LeftClick;
@@ -58,8 +60,92 @@ public sealed class TrayIcon : IDisposable
         });
         _source.AddHook(WndProc);
         _taskbarCreated = NativeMethods.RegisterWindowMessage("TaskbarCreated");
-        _icon = LoadAppIcon();
+        _icon = LoadStateIcon(_vpnOn);
+        if (_icon == IntPtr.Zero)
+        {
+            _icon = LoadAppIcon();
+        }
+
         AddIcon();
+    }
+
+    /// <summary>Accent icon while the VPN is on, gray icon when it is off.</summary>
+    public void SetVpnOn(bool vpnOn)
+    {
+        if (_vpnOn == vpnOn || _icon == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var next = LoadStateIcon(vpnOn);
+        if (next == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _vpnOn = vpnOn;
+        var previous = _icon;
+        _icon = next;
+        Log.Info($"Tray icon: {(vpnOn ? "VPN on (accent)" : "VPN off (gray)")}");
+
+        if (_added)
+        {
+            var data = CreateData(NIF_ICON);
+            NativeMethods.Shell_NotifyIcon(NIM_MODIFY, ref data);
+        }
+
+        NativeMethods.DestroyIcon(previous);
+    }
+
+    private static IntPtr LoadStateIcon(bool vpnOn)
+    {
+        var resource = vpnOn ? "Assets/tray-on.ico" : "Assets/tray-off.ico";
+        try
+        {
+            var info = Application.GetResourceStream(new Uri(resource, UriKind.Relative));
+            if (info is null)
+            {
+                return IntPtr.Zero;
+            }
+
+            using var stream = info.Stream;
+            using var buffer = new MemoryStream();
+            stream.CopyTo(buffer);
+            var bytes = buffer.ToArray();
+            if (bytes.Length < 22 || BitConverter.ToUInt16(bytes, 2) != 1)
+            {
+                return IntPtr.Zero;
+            }
+
+            int count = BitConverter.ToUInt16(bytes, 4);
+            if (count < 1)
+            {
+                return IntPtr.Zero;
+            }
+
+            var size = (int)BitConverter.ToUInt32(bytes, 6 + 8);
+            var offset = (int)BitConverter.ToUInt32(bytes, 6 + 12);
+            if (size <= 0 || offset + size > bytes.Length)
+            {
+                return IntPtr.Zero;
+            }
+
+            var pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            try
+            {
+                var pointer = pinned.AddrOfPinnedObject() + offset;
+                return NativeMethods.CreateIconFromResourceEx(pointer, (uint)size, true, 0x00030000, 0, 0, 0);
+            }
+            finally
+            {
+                pinned.Free();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("State icon: " + ex.Message);
+            return IntPtr.Zero;
+        }
     }
 
     private static IntPtr LoadAppIcon()
@@ -312,6 +398,10 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern IntPtr LoadIcon(IntPtr instance, IntPtr name);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr CreateIconFromResourceEx(IntPtr presbits, uint dwResSize, bool fIcon,
+        uint dwVer, int cxDesired, int cyDesired, uint flags);
 
     [DllImport("user32.dll")]
     public static extern bool DestroyIcon(IntPtr icon);
