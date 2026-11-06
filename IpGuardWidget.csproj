@@ -13,8 +13,8 @@
     <AssemblyTitle>IP Guard</AssemblyTitle>
     <Product>IP Guard</Product>
     <Description>IP Guard — widget for Windows 10/11 that checks your IP country and launches Claude Code.</Description>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
+    <Version>1.2.0</Version>
+    <FileVersion>1.2.0.0</FileVersion>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
 

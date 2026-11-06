@@ -14,6 +14,13 @@ public enum WidgetState
     Offline
 }
 
+/// <summary>Colours of the notice in the card: warning (VPN off, launch error) or success.</summary>
+public enum NoticeStyle
+{
+    Warning,
+    Success
+}
+
 public sealed class WidgetViewModel : ObservableObject, IDisposable
 {
     private static readonly Brush SuccessPillBackground = Frozen("#1F34C759");
@@ -31,10 +38,28 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
     private static readonly Brush WhiteText = Frozen("#FFFFFF");
     private static readonly Brush DisabledText = Frozen("#71717A");
 
+    private static readonly Brush WarningNoticeBackground = Frozen("#0FFFA30A");
+    private static readonly Brush WarningNoticeIcon = Frozen("#1FFF9F0A");
+    private static readonly Brush WarningNoticeGlyph = Frozen("#FF9F0A");
+    private static readonly Brush WarningNoticeTitle = Frozen("#FFB340");
+    private static readonly Brush WarningNoticeText = Frozen("#A98F63");
+    private static readonly Brush SuccessNoticeBackground = Frozen("#1F34C759");
+    private static readonly Brush SuccessNoticeIcon = Frozen("#1F34C759");
+    private static readonly Brush SuccessNoticeGlyph = Frozen("#34C759");
+    private static readonly Brush SuccessNoticeTitle = Frozen("#4ADE80");
+    private static readonly Brush SuccessNoticeText = Frozen("#8FB79A");
+
+    /// <summary>Notice card height when the title fits one line.</summary>
+    public const double NoticeSingleLineHeight = 49;
+
+    /// <summary>Notice card height when the title wraps to two lines.</summary>
+    public const double NoticeTwoLineHeight = 58;
+
     private readonly IpCheckService _ipService;
     private readonly string? _simulate;
     private readonly DispatcherTimer _timer;
     private readonly DispatcherTimer _copiedTimer;
+    private readonly DispatcherTimer _flashTimer;
 
     private CancellationTokenSource? _cts;
     private GeoResult? _last;
@@ -43,7 +68,10 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
     private bool _checking;
     private bool _visibleChecking;
     private bool _copied;
-    private (string Title, string Body)? _noticeOverride;
+    private string? _footerFlash;
+    private (string Title, string Body, NoticeStyle Style)? _noticeOverride;
+    private bool _noticeSticky;
+    private ClaudeGuardReason? _guardReason;
 
     private string _ipAddress = "—";
     private string _ipFamily = "IPv4";
@@ -61,8 +89,15 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
     private bool _showWarn;
     private bool _showSpinner = true;
     private bool _showNotice;
+    private double _noticeHeight = NoticeSingleLineHeight;
     private string _noticeTitle = "";
     private string _noticeBody = "";
+    private Brush _noticeBackground = WarningNoticeBackground;
+    private Brush _noticeIconBackground = WarningNoticeIcon;
+    private Brush _noticeIconForeground = WarningNoticeGlyph;
+    private Brush _noticeTitleBrush = WarningNoticeTitle;
+    private Brush _noticeTextBrush = WarningNoticeText;
+    private string _noticeGlyph = "!";
     private bool _isButtonEnabled;
     private bool _showPromptIcon;
     private bool _showLockIcon;
@@ -90,6 +125,14 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
             UpdatePresentation();
         };
 
+        _flashTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _flashTimer.Tick += (_, _) =>
+        {
+            _flashTimer.Stop();
+            _footerFlash = null;
+            UpdatePresentation();
+        };
+
         NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
     }
 
@@ -114,8 +157,31 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
     public bool ShowWarn { get => _showWarn; private set => SetProperty(ref _showWarn, value); }
     public bool ShowSpinner { get => _showSpinner; private set => SetProperty(ref _showSpinner, value); }
     public bool ShowNotice { get => _showNotice; private set => SetProperty(ref _showNotice, value); }
+
+    /// <summary>
+    /// Height of the notice card: <see cref="NoticeSingleLineHeight"/> for a one-line title,
+    /// <see cref="NoticeTwoLineHeight"/> when the title wraps. Set from MainWindow.
+    /// </summary>
+    public double NoticeHeight
+    {
+        get => _noticeHeight;
+        set
+        {
+            if (SetProperty(ref _noticeHeight, value) && ShowNotice)
+            {
+                LayoutChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+    }
+
     public string NoticeTitle { get => _noticeTitle; private set => SetProperty(ref _noticeTitle, value); }
     public string NoticeBody { get => _noticeBody; private set => SetProperty(ref _noticeBody, value); }
+    public Brush NoticeBackground { get => _noticeBackground; private set => SetProperty(ref _noticeBackground, value); }
+    public Brush NoticeIconBackground { get => _noticeIconBackground; private set => SetProperty(ref _noticeIconBackground, value); }
+    public Brush NoticeIconForeground { get => _noticeIconForeground; private set => SetProperty(ref _noticeIconForeground, value); }
+    public Brush NoticeTitleBrush { get => _noticeTitleBrush; private set => SetProperty(ref _noticeTitleBrush, value); }
+    public Brush NoticeTextBrush { get => _noticeTextBrush; private set => SetProperty(ref _noticeTextBrush, value); }
+    public string NoticeGlyph { get => _noticeGlyph; private set => SetProperty(ref _noticeGlyph, value); }
     public bool IsButtonEnabled { get => _isButtonEnabled; private set => SetProperty(ref _isButtonEnabled, value); }
     public bool ShowPromptIcon { get => _showPromptIcon; private set => SetProperty(ref _showPromptIcon, value); }
     public bool ShowLockIcon { get => _showLockIcon; private set => SetProperty(ref _showLockIcon, value); }
@@ -130,6 +196,12 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
     public DateTime? LastChecked => _lastChecked;
     public bool IsBusy => _checking;
 
+    /// <summary>
+    /// True when the last check failed. The card keeps the last known IP and the "НЕТ СЕТИ" pill,
+    /// so <see cref="State"/> can stay Allowed; the guard must look at this flag as well.
+    /// </summary>
+    public bool IsOffline => _offline;
+
     public void Start() => _ = CheckAsync(showChecking: true);
 
     public async Task CheckAsync(bool showChecking)
@@ -142,7 +214,12 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         _checking = true;
         _timer.Stop();
         _copied = false;
-        _noticeOverride = null;
+
+        // A background check must not wipe the notice that the guard put on screen.
+        if (!_noticeSticky)
+        {
+            _noticeOverride = null;
+        }
 
         if (showChecking)
         {
@@ -185,7 +262,32 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
 
     public void SetErrorNotice(string title, string body)
     {
-        _noticeOverride = (title, body);
+        _noticeOverride = (title, body, NoticeStyle.Warning);
+        _noticeSticky = false;
+        _guardReason = null;
+        NoticeHeight = NoticeSingleLineHeight;
+        UpdatePresentation();
+    }
+
+    /// <summary>
+    /// Warning notice about Claude Code running without VPN or network. It survives background
+    /// IP checks and stays until the state allows launching again or the notice is cleared.
+    /// </summary>
+    public void SetStoppedNotice(string title, string body, ClaudeGuardReason reason)
+    {
+        _noticeOverride = (title, body, NoticeStyle.Warning);
+        _noticeSticky = true;
+        _guardReason = reason;
+        UpdatePresentation();
+    }
+
+    /// <summary>Success notice shown when the state is allowed again after the guard warned.</summary>
+    public void SetRestoredNotice(string title, string body)
+    {
+        _noticeOverride = (title, body, NoticeStyle.Success);
+        _noticeSticky = true;
+        _guardReason = null;
+        NoticeHeight = NoticeSingleLineHeight;
         UpdatePresentation();
     }
 
@@ -197,6 +299,9 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         }
 
         _noticeOverride = null;
+        _noticeSticky = false;
+        _guardReason = null;
+        NoticeHeight = NoticeSingleLineHeight;
         UpdatePresentation();
     }
 
@@ -208,19 +313,27 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         UpdatePresentation();
     }
 
+    /// <summary>Shows a one-off message in the card footer for ~5 s, then the usual text returns.</summary>
+    public void FlashFooter(string text)
+    {
+        _footerFlash = text;
+        FooterLeft = text;
+        _flashTimer.Stop();
+        _flashTimer.Start();
+    }
+
     private void ScheduleNext()
     {
-        // Russia: poll fast to catch the moment the VPN is switched on (5 s).
-        // VPN on: poll slower, just to notice a changed IP/country (20 s).
-        // Offline: retry until the network is back (30 s).
-        var interval = _offline
-            ? TimeSpan.FromSeconds(30)
-            : State == WidgetState.Blocked
-                ? TimeSpan.FromSeconds(5)
-                : TimeSpan.FromSeconds(20);
+        // 1 s while the result can change quickly or matters at once: blocked / offline /
+        // first check in progress, or Claude Code is running (a lost VPN or network must be
+        // noticed and the process stopped immediately).
+        // 20 s when the VPN is on and Claude Code is not running — just to notice a new IP.
+        var fast = IsOffline
+                   || State is WidgetState.Blocked or WidgetState.Offline or WidgetState.Checking
+                   || ClaudeGuard.IsClaudeRunning();
 
         _timer.Stop();
-        _timer.Interval = interval;
+        _timer.Interval = TimeSpan.FromSeconds(fast ? 1 : 20);
         _timer.Start();
     }
 
@@ -317,16 +430,26 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
                 : SuccessBadge;
 
         var showNotice = State == WidgetState.Blocked || _noticeOverride is not null;
+        var noticeStyle = NoticeStyle.Warning;
         if (_noticeOverride is { } notice)
         {
             NoticeTitle = notice.Title;
             NoticeBody = notice.Body;
+            noticeStyle = notice.Style;
         }
         else
         {
             NoticeTitle = "Claude Code заблокирован в РФ";
             NoticeBody = "Включи VPN — кнопка включится после смены IP";
         }
+
+        var success = noticeStyle == NoticeStyle.Success;
+        NoticeBackground = success ? SuccessNoticeBackground : WarningNoticeBackground;
+        NoticeIconBackground = success ? SuccessNoticeIcon : WarningNoticeIcon;
+        NoticeIconForeground = success ? SuccessNoticeGlyph : WarningNoticeGlyph;
+        NoticeTitleBrush = success ? SuccessNoticeTitle : WarningNoticeTitle;
+        NoticeTextBrush = success ? SuccessNoticeText : WarningNoticeText;
+        NoticeGlyph = success ? "✓" : "!";
 
         var noticeChanged = ShowNotice != showNotice;
         ShowNotice = showNotice;
@@ -355,6 +478,15 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
             ShowLockIcon = true;
             ButtonForeground = DisabledText;
         }
+        else if (_offline)
+        {
+            // The network is gone: the last known IP is still on screen, but nothing can be launched.
+            ButtonLabel = "Нет соединения";
+            IsButtonEnabled = false;
+            ShowPromptIcon = false;
+            ShowLockIcon = false;
+            ButtonForeground = DisabledText;
+        }
         else
         {
             ButtonLabel = "Run Claude";
@@ -367,6 +499,13 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         if (_copied)
         {
             FooterLeft = "IP скопирован";
+        }
+        else if (_noticeSticky && _noticeOverride is { Style: NoticeStyle.Warning } &&
+                 _guardReason == ClaudeGuardReason.VpnLost)
+        {
+            // Claude Code keeps working without the VPN: the footer says what is going on.
+            // The network case falls through to the usual "Нет сети · данные в HH:MM".
+            FooterLeft = "VPN отключён · Claude Code работает";
         }
         else if (checking)
         {
@@ -392,11 +531,17 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         }
 
         FooterLink = !hasData && !checking ? "Повторить" : "Обновить IP";
-        IsFooterLinkEnabled = !_checking;
+        IsFooterLinkEnabled = !checking;
+
+        if (_footerFlash is { } flash)
+        {
+            FooterLeft = flash;
+        }
 
         TooltipText = hasData ? $"IP Guard · {IpAddress} · {PillText}" : "IP Guard";
 
         OnPropertyChanged(nameof(State));
+        OnPropertyChanged(nameof(IsOffline));
         OnPropertyChanged(nameof(LastChecked));
 
         if (noticeChanged)
@@ -425,6 +570,7 @@ public sealed class WidgetViewModel : ObservableObject, IDisposable
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
         _timer.Stop();
         _copiedTimer.Stop();
+        _flashTimer.Stop();
         _cts?.Cancel();
         _cts?.Dispose();
     }

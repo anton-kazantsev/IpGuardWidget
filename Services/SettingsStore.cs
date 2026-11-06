@@ -18,6 +18,9 @@ public sealed class Settings
     public string Shell { get; set; } = "";
     public string WorkingDirectory { get; set; } = "";
     public string ClaudePath { get; set; } = "";
+
+    /// <summary>Release tag the user postponed: its banner is not shown again.</summary>
+    public string PostponedUpdateTag { get; set; } = "";
 }
 
 public sealed class SettingsStore

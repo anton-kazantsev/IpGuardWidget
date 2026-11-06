@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -16,7 +17,11 @@ public partial class MainWindow : Window
     private const double WindowPadding = 16;
     private const double CardNormalHeight = 288;
     private const double CardNoticeHeight = 351;
-    private const double NoticeHostHeight = 63;
+    private const double NoticeGap = 14;
+    private const double BannerPanelHeight = 72;
+    private const double BannerHostHeight = BannerPanelHeight + 8;
+    private const double WhatsNewPanelHeight = 348;
+    private const double WhatsNewHostHeight = WhatsNewPanelHeight + 8;
     private const double PopupGap = 8;
     private const double PopupPanelWidth = 178;
     private const double PopupPanelHeight = 98;
@@ -30,11 +35,16 @@ public partial class MainWindow : Window
 
     private readonly SettingsStore _store;
     private readonly WidgetViewModel _viewModel;
+    private readonly UpdateViewModel _update;
     private readonly LaunchService _launcher = new();
     private readonly ClaudeGuard _claudeGuard;
     private readonly DispatcherTimer _saveTimer;
+    private readonly DispatcherTimer _autoHideTimer;
     private TrayIcon? _tray;
     private bool _exiting;
+    private bool _autoShownForStop;
+    private bool _restoredNoticeShown;
+    private ClaudeGuardReason _guardReason;
     private double _targetRight;
     private double _targetBottom;
 
@@ -46,9 +56,33 @@ public partial class MainWindow : Window
         _viewModel = new WidgetViewModel(new IpCheckService(), simulate);
         DataContext = _viewModel;
 
-        // Stops `claude` started from any terminal while the VPN is off.
-        _claudeGuard = new ClaudeGuard(() => _viewModel.State == WidgetState.Blocked);
+        // The banner and the panel live outside the card, so they get their own DataContext.
+        _update = new UpdateViewModel(store, _viewModel);
+        WhatsNewHost.DataContext = _update;
+        BannerHost.DataContext = _update;
+
+        // Blocks `claude` started from any terminal while the VPN is off or the network is gone,
+        // and warns once when a running Claude Code loses its VPN or the connection.
+        _claudeGuard = new ClaudeGuard(() => _viewModel.State, () => _viewModel.IsOffline);
         _claudeGuard.BlockedLaunch += (_, _) => ShowWidget();
+        _claudeGuard.UnsafeDetected += ClaudeGuard_UnsafeDetected;
+
+        // After the warning, a restored VPN lets the widget collapse itself in 3 s.
+        _autoHideTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+        _autoHideTimer.Tick += (_, _) =>
+        {
+            _autoHideTimer.Stop();
+            if (!_autoShownForStop)
+            {
+                return;
+            }
+
+            _autoShownForStop = false;
+            _restoredNoticeShown = false;
+            _viewModel.ClearNotice();
+            Hide();
+            SavePlacement();
+        };
 
         Deactivated += (_, _) => ShellPopup.IsOpen = false;
         ShellPopup.Opened += (_, _) => AnimateShellChevron(90);
@@ -74,10 +108,16 @@ public partial class MainWindow : Window
         _viewModel.LayoutChanged += (_, _) => ApplyLayout(animate: true);
         _viewModel.PropertyChanged += ViewModel_PropertyChanged;
 
+        _update.LayoutChanged += (_, _) => ApplyLayout(animate: true);
+        _update.RestartRequested += (_, _) => ExitApplication();
+
         // Windows may nudge a borderless window after it is shown (multi-monitor setups,
         // monitor hot-plug). Re-check the real position once the first layout is done.
         Loaded += (_, _) => EnsureOnScreen();
     }
+
+    /// <summary>Update state for the banner, the panel and the header check button (used in bindings).</summary>
+    public UpdateViewModel Update => _update;
 
     private void EnsureOnScreen()
     {
@@ -119,6 +159,7 @@ public partial class MainWindow : Window
         EnsureOnScreen();
 
         _viewModel.Start();
+        _update.Initialize();
     }
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -131,11 +172,95 @@ public partial class MainWindow : Window
         {
             // Tray icon follows the VPN state: accent when the VPN is on, gray otherwise.
             _tray?.SetVpnOn(_viewModel.State == WidgetState.Allowed);
+
+            if (_viewModel.State == WidgetState.Allowed)
+            {
+                ShowRestoredNotice();
+            }
+            else if (_restoredNoticeShown)
+            {
+                // The connection dropped again while the success notice was on screen: the promise
+                // no longer holds, so the notice goes with the state change.
+                _autoHideTimer.Stop();
+                _autoShownForStop = false;
+                _restoredNoticeShown = false;
+                _viewModel.ClearNotice();
+            }
         }
+    }
+
+    /// <summary>True when Claude Code must not run: blocked country or a lost network.</summary>
+    private bool IsUnsafe =>
+        _viewModel.State is WidgetState.Blocked or WidgetState.Offline || _viewModel.IsOffline;
+
+    /// <summary>
+    /// Claude Code keeps running while the VPN or the network went away: show the widget and
+    /// explain that the session goes on unprotected. From here on, a restored connection
+    /// collapses the widget by itself.
+    /// </summary>
+    private void ClaudeGuard_UnsafeDetected(object? sender, ClaudeGuardEventArgs e)
+    {
+        _autoShownForStop = true;
+        _restoredNoticeShown = false;
+        _guardReason = e.Reason;
+        _autoHideTimer.Stop();
+
+        if (e.Reason == ClaudeGuardReason.NetworkLost)
+        {
+            _viewModel.NoticeHeight = WidgetViewModel.NoticeSingleLineHeight;
+            _viewModel.SetStoppedNotice("Нет сети — команды не уходят", "Проверь соединение и продолжи", e.Reason);
+        }
+        else
+        {
+            // The title wraps to two lines at this width, so the notice card grows.
+            _viewModel.NoticeHeight = WidgetViewModel.NoticeTwoLineHeight;
+            _viewModel.SetStoppedNotice("VPN отключён — Claude Code продолжает работать",
+                "Включи VPN, чтобы не работать без защиты", e.Reason);
+        }
+
+        ShowWidget();
+    }
+
+    /// <summary>Allowed again after an automatic show: a success notice, then a collapse in 3 s.</summary>
+    private void ShowRestoredNotice()
+    {
+        // While the network is gone the state stays Allowed (the last IP is still on screen),
+        // so a restored connection must be checked explicitly, not only through State.
+        if (!_autoShownForStop || _restoredNoticeShown || _viewModel.IsOffline ||
+            _viewModel.State != WidgetState.Allowed || !IsVisible)
+        {
+            return;
+        }
+
+        _restoredNoticeShown = true;
+        var title = _guardReason == ClaudeGuardReason.NetworkLost
+            ? "Связь восстановлена — можно продолжать"
+            : "VPN включён — можно продолжать";
+        _viewModel.SetRestoredNotice(title, "Виджет свернётся в трей через 3 с");
+        _autoHideTimer.Stop();
+        _autoHideTimer.Start();
+    }
+
+    /// <summary>
+    /// The user took over the window (a click, a drag, a manual hide or show): there is no
+    /// automatic collapse any more. The success notice and the card layout are left alone, so
+    /// the height does not jump under the cursor; the notice goes away with the next state
+    /// change (see <see cref="ViewModel_PropertyChanged"/>) or an explicit ClearNotice.
+    /// </summary>
+    private void CancelAutoCollapse()
+    {
+        if (!_autoShownForStop)
+        {
+            return;
+        }
+
+        _autoHideTimer.Stop();
+        _autoShownForStop = false;
     }
 
     private void CollapseButton_Click(object sender, RoutedEventArgs e)
     {
+        CancelAutoCollapse();
         ShellPopup.IsOpen = false;
         Hide();
         SavePlacement();
@@ -162,6 +287,10 @@ public partial class MainWindow : Window
     /// <summary>Closes the shell flyout when the user clicks anywhere else in the card.</summary>
     private void Root_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
+        // A click (or the start of a drag) means the user is working in the window:
+        // no automatic collapse after the restored connection.
+        CancelAutoCollapse();
+
         if (!ShellPopup.IsOpen || IsInside(e.OriginalSource as DependencyObject, ShellButton))
         {
             return;
@@ -303,6 +432,7 @@ public partial class MainWindow : Window
 
     private void ToggleVisibility()
     {
+        CancelAutoCollapse();
         ShellPopup.IsOpen = false;
 
         if (IsVisible)
@@ -324,6 +454,7 @@ public partial class MainWindow : Window
         }
 
         e.Cancel = true;
+        CancelAutoCollapse();
         Hide();
         SavePlacement();
     }
@@ -332,6 +463,7 @@ public partial class MainWindow : Window
     {
         if (e.Key == Key.Escape)
         {
+            CancelAutoCollapse();
             Hide();
             SavePlacement();
         }
@@ -377,7 +509,8 @@ public partial class MainWindow : Window
 
     private async void RunButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_viewModel.State != WidgetState.Allowed)
+        // Nothing to launch without a fresh check: no network or a blocked country is not a go.
+        if (_viewModel.State != WidgetState.Allowed || IsUnsafe)
         {
             return;
         }
@@ -389,7 +522,7 @@ public partial class MainWindow : Window
             DateTime.Now - _viewModel.LastChecked > TimeSpan.FromSeconds(45))
         {
             await _viewModel.CheckAsync(showChecking: false);
-            if (_viewModel.State == WidgetState.Blocked)
+            if (IsUnsafe)
             {
                 return;
             }
@@ -408,6 +541,55 @@ public partial class MainWindow : Window
     private async void RefreshLink_Click(object sender, RoutedEventArgs e)
     {
         await _viewModel.RefreshAsync();
+    }
+
+    private async void CheckUpdates_Click(object sender, RoutedEventArgs e)
+    {
+        await _update.CheckAsync(silent: false);
+    }
+
+    private async void UpdatePrimary_Click(object sender, RoutedEventArgs e)
+    {
+        await _update.PrimaryActionAsync();
+    }
+
+    private void UpdateWhatsNew_Click(object sender, RoutedEventArgs e)
+    {
+        _update.ToggleWhatsNew();
+    }
+
+    private void UpdatePostpone_Click(object sender, RoutedEventArgs e)
+    {
+        _update.Postpone();
+    }
+
+    private async void WhatsNewDownload_Click(object sender, RoutedEventArgs e)
+    {
+        _update.HideWhatsNew();
+        await _update.PrimaryActionAsync();
+    }
+
+    private void WhatsNewHide_Click(object sender, RoutedEventArgs e)
+    {
+        _update.HideWhatsNew();
+    }
+
+    private void OpenRelease_Click(object sender, RoutedEventArgs e)
+    {
+        var url = _update.ReleaseUrl;
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Open release page: " + ex.Message);
+        }
     }
 
     private void CopyButton_Click(object sender, RoutedEventArgs e)
@@ -432,6 +614,7 @@ public partial class MainWindow : Window
         {
             new(1, IsVisible ? "Скрыть" : "Показать", IsDefault: true),
             new(2, "Обновить IP"),
+            new(8, "Проверить обновления"),
             new(0, "", IsSeparator: true),
             new(3, "Всегда сверху", Checked: Topmost),
             new(4, "Автозапуск", Checked: StartupService.IsEnabled()),
@@ -459,6 +642,9 @@ public partial class MainWindow : Window
                 break;
             case 2:
                 _ = _viewModel.RefreshAsync();
+                break;
+            case 8:
+                _ = _update.CheckAsync(silent: false);
                 break;
             case 3:
                 Topmost = !Topmost;
@@ -527,7 +713,9 @@ public partial class MainWindow : Window
     {
         _exiting = true;
         SavePlacement();
+        _autoHideTimer.Stop();
         _claudeGuard.Dispose();
+        _update.Dispose();
         _viewModel.Dispose();
         _tray?.Dispose();
         _tray = null;
@@ -624,9 +812,16 @@ public partial class MainWindow : Window
 
     private void ApplyLayout(bool animate)
     {
-        var cardHeight = _viewModel.ShowNotice ? CardNoticeHeight : CardNormalHeight;
-        var windowHeight = cardHeight + WindowPadding * 2;
-        var noticeHeight = _viewModel.ShowNotice ? NoticeHostHeight : 0;
+        // The notice card is 49 px for a one-line title and 58 px when the title wraps to two
+        // lines; the card and the host follow it.
+        var noticeCardHeight = _viewModel.ShowNotice ? _viewModel.NoticeHeight : 0;
+        var noticeHeight = _viewModel.ShowNotice ? noticeCardHeight + NoticeGap : 0;
+        var cardHeight = _viewModel.ShowNotice
+            ? CardNoticeHeight + (noticeCardHeight - WidgetViewModel.NoticeSingleLineHeight)
+            : CardNormalHeight;
+        var bannerHeight = _update.ShowBanner ? BannerHostHeight : 0;
+        var whatsNewHeight = _update.ShowWhatsNew ? WhatsNewHostHeight : 0;
+        var windowHeight = cardHeight + bannerHeight + whatsNewHeight + WindowPadding * 2;
 
         // Anchor the card's bottom edge: the card grows upwards when the notice appears,
         // so the saved bottom-right position stays put across restarts.
@@ -638,6 +833,8 @@ public partial class MainWindow : Window
             Card.Height = cardHeight;
             ShadowLayer.Height = cardHeight;
             NoticeHost.Height = noticeHeight;
+            BannerHost.Height = bannerHeight;
+            WhatsNewHost.Height = whatsNewHeight;
             Height = windowHeight;
             Top = targetTop;
             return;
@@ -646,10 +843,14 @@ public partial class MainWindow : Window
         var fromCard = Card.Height;
         var fromShadow = ShadowLayer.Height;
         var fromNotice = NoticeHost.Height;
+        var fromBanner = BannerHost.Height;
+        var fromWhatsNew = WhatsNewHost.Height;
         var fromWindow = Height;
         var fromTop = Top;
 
-        Log.Info($"Layout: card {fromCard:F0}->{cardHeight:F0}, window {fromWindow:F0}->{windowHeight:F0}, top {fromTop:F0}->{targetTop:F0}");
+        Log.Info($"Layout: card {fromCard:F0}->{cardHeight:F0}, banner {fromBanner:F0}->{bannerHeight:F0}, " +
+                 $"whatsnew {fromWhatsNew:F0}->{whatsNewHeight:F0}, window {fromWindow:F0}->{windowHeight:F0}, " +
+                 $"top {fromTop:F0}->{targetTop:F0}");
 
         var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
         var duration = TimeSpan.FromMilliseconds(260);
@@ -657,6 +858,8 @@ public partial class MainWindow : Window
         Animate(Card, FrameworkElement.HeightProperty, fromCard, cardHeight, duration, ease);
         Animate(ShadowLayer, FrameworkElement.HeightProperty, fromShadow, cardHeight, duration, ease);
         Animate(NoticeHost, FrameworkElement.HeightProperty, fromNotice, noticeHeight, duration, ease);
+        Animate(BannerHost, FrameworkElement.HeightProperty, fromBanner, bannerHeight, duration, ease);
+        Animate(WhatsNewHost, FrameworkElement.HeightProperty, fromWhatsNew, whatsNewHeight, duration, ease);
         Animate(this, Window.HeightProperty, fromWindow, windowHeight, duration, ease);
 
         if (Math.Abs(fromTop - targetTop) > 0.5)

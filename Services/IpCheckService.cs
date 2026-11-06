@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http;
 using System.Text.Json;
 
@@ -13,6 +14,15 @@ public sealed record GeoResult(
 
 public sealed class IpCheckService
 {
+    /// <summary>
+    /// For the QA modes below: their phases are counted from the process start, so a manual
+    /// check does not depend on when the first IP check happened.
+    /// </summary>
+    private static readonly Stopwatch Uptime = Stopwatch.StartNew();
+
+    private static readonly TimeSpan QaHealthy = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan QaBroken = TimeSpan.FromSeconds(6);
+
     /// <summary>
     /// A fresh client per check with no connection reuse: when a VPN is toggled, pooled
     /// TCP connections keep using the old route and the widget would see the old IP forever.
@@ -48,6 +58,10 @@ public sealed class IpCheckService
                 "IPV6" => new GeoResult("2a02:8071:50:4a80::1", "IPv6", "DE", "Germany", "Berlin", "simulate"),
                 "SLOW" => await SlowAsync(ct),
                 "OFFLINE" => throw new HttpRequestException("simulate: network is unreachable"),
+                // QA only: manual checks of "the VPN or the network went away while Claude Code
+                // was running". Both start with 8 s of NL, break for 6 s, then heal.
+                "LOSS" => LossPhase(),
+                "VPNOFF" => VpnOffPhase(),
                 _ => new GeoResult("185.42.12.87", "IPv4", "NL", "Netherlands", "Amsterdam", "simulate")
             };
         }
@@ -73,6 +87,35 @@ public sealed class IpCheckService
         await Task.Delay(3500, ct).ConfigureAwait(false);
         return new GeoResult("185.42.12.87", "IPv4", "NL", "Netherlands", "Amsterdam", "simulate");
     }
+
+    /// <summary>
+    /// QA only (`--simulate LOSS`): 8 s of NL, then 6 s without network, then NL again —
+    /// counted from the process start, for checking that Claude Code is stopped and then resumed.
+    /// </summary>
+    private static GeoResult LossPhase()
+    {
+        if (QaIsBroken)
+        {
+            throw new HttpRequestException("simulate: network is unreachable");
+        }
+
+        return QaNetherlands();
+    }
+
+    /// <summary>
+    /// QA only (`--simulate VPNOFF`): 8 s of NL, then 6 s of RU (the VPN is off), then NL again —
+    /// counted from the process start, for checking that Claude Code is stopped and then resumed.
+    /// </summary>
+    private static GeoResult VpnOffPhase()
+        => QaIsBroken
+            ? new GeoResult("95.163.248.14", "IPv4", "RU", "Russia", "Moscow", "simulate")
+            : QaNetherlands();
+
+    private static bool QaIsBroken
+        => Uptime.Elapsed >= QaHealthy && Uptime.Elapsed < QaHealthy + QaBroken;
+
+    private static GeoResult QaNetherlands()
+        => new("185.42.12.87", "IPv4", "NL", "Netherlands", "Amsterdam", "simulate");
 
     private static async Task<(string Ip, string Family)> GetIpAsync(HttpClient client, CancellationToken ct)
     {
